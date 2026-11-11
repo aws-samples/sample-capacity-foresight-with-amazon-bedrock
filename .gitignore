@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+packaged.yaml
+.aws-sam/
+.DS_Store
+evals/results/
+.ash/
+.holmes/

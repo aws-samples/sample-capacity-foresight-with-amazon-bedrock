@@ -1,0 +1,1228 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Capacity Foresight. Forecasts CloudWatch metric trends for tagged EC2, RDS and EBS resources,
+  predicts threshold breaches, asks Amazon Bedrock for a remediation plan, and emails the operator.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Required }
+        Parameters: [NotificationEmail, BedrockModelId, BedrockFoundationModelId]
+      - Label: { default: Models (optional) }
+        Parameters:
+          - BedrockHighRiskModelId
+          - BedrockHighRiskFoundationModelId
+          - BedrockFallbackModelId
+          - BedrockFallbackFoundationModelId
+          - CreateGuardrail
+          - GuardrailId
+          - GuardrailVersion
+          - RecommendationCacheHours
+      - Label: { default: Scope }
+        Parameters: [DiscoveryTagKey, DiscoveryTagValue, ContextTagKeys, RoutingTagKey, MaxResources]
+      - Label: { default: Optional AWS signals for better recommendations }
+        Parameters: [EnableRdsEvents, EnableComputeOptimizer, EnableCloudTrailChanges]
+      - Label: { default: Schedule and alerting }
+        Parameters: [ScheduleExpression, ScheduleState, SuppressionDays, MinImmediateUrgency, EnableDigest, DigestPerRoute, DigestSchedule, EnableAlarms, MissingRunAlarmHours]
+      - Label: { default: Housekeeping }
+        Parameters: [ResourcePrefix, GlueDatabaseName, DataRetentionDays, LogRetentionDays]
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Address that receives capacity alerts. You must confirm the SNS subscription email.
+  BedrockModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-5-5
+    AllowedPattern: '^[a-zA-Z0-9.:\-]+$'
+    Description: >-
+      Model ID or inference profile ID used with the Bedrock Converse API. The model must support tool use
+      and be enabled for your account in this Region.
+  BedrockFoundationModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-5-5
+    AllowedPattern: '^[a-z0-9.\-]+(:[0-9]+)?$'
+    Description: >-
+      Base model behind BedrockModelId. IAM is scoped to exactly this model and to the inference profile in
+      BedrockModelId. If BedrockModelId is a plain model ID, set both parameters to the same value.
+  BedrockHighRiskModelId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([a-zA-Z0-9.:\-]+)?$'
+    Description: >-
+      Optional. Model or inference profile used for CRITICAL and HIGH findings (for example a larger model).
+      Leave empty to use BedrockModelId for everything.
+  BedrockHighRiskFoundationModelId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([a-z0-9.\-]+(:[0-9]+)?)?$'
+    Description: Base model behind BedrockHighRiskModelId. Required when that parameter is set.
+  BedrockFallbackModelId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([a-zA-Z0-9.:\-]+)?$'
+    Description: >-
+      Optional. Tried automatically when the chosen model fails (throttled, access denied, end of life, or
+      invalid output). Setting a second model protects you from a model being retired.
+  BedrockFallbackFoundationModelId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([a-z0-9.\-]+(:[0-9]+)?)?$'
+    Description: Base model behind BedrockFallbackModelId. Required when that parameter is set.
+  CreateGuardrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create an Amazon Bedrock Guardrail with the prompt-attack filter and apply it to every model call.
+      Set to false to use your own guardrail (GuardrailId) or none.
+  RecommendationCacheHours:
+    Type: Number
+    Default: 12
+    MinValue: 0
+    MaxValue: 168
+    Description: >-
+      Reuse a recommendation for an unchanged finding for this many hours instead of calling the model on every run.
+      0 turns the cache off.
+  RoutingTagKey:
+    Type: String
+    Default: ""
+    AllowedPattern: '^[A-Za-z0-9 _.:/=+@-]{0,128}$'
+    Description: >-
+      Optional. Resource tag whose value (for example the owning team) is added to each alert as the SNS message
+      attribute "route". Teams then subscribe with an SNS filter policy.
+  EnableRdsEvents:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Give the model the last 7 days of RDS events for the instance (needs rds:DescribeEvents).
+  EnableComputeOptimizer:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Give the model AWS Compute Optimizer rightsizing findings. Compute Optimizer must be opted in for the account.
+  EnableCloudTrailChanges:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Give the model the names and times (never identities) of recent write API calls on the resource, from CloudTrail
+      event history. Needs cloudtrail:LookupEvents.
+  MinImmediateUrgency:
+    Type: String
+    Default: LOW
+    AllowedValues: [LOW, MEDIUM, HIGH, CRITICAL]
+    Description: Findings below this urgency are not emailed immediately. They appear in the digest and the dashboard.
+  EnableDigest:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Send a daily summary email of open findings. One email, or one per route when DigestPerRoute is true.
+  DigestPerRoute:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Send one digest per route (team) with a route message attribute, for teams that subscribe with a filter policy.
+      Leave false to get a single digest.
+  DigestSchedule:
+    Type: String
+    Default: cron(0 13 * * ? *)
+    AllowedPattern: '^(rate|cron)\(.+\)$'
+    Description: When the digest runs (UTC).
+  EnableAlarms:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create CloudWatch alarms for failed workflow runs, Lambda errors, AI recommendations falling back to the plain
+      notice, and a missing run. Alarm notifications go to the same SNS topic.
+  MissingRunAlarmHours:
+    Type: String
+    Default: "12"
+    AllowedValues: ["6", "12", "18", "24"]
+    Description: Alarm if the workflow has not started in this many hours. Set it to at least twice your schedule interval.
+  ResourcePrefix:
+    Type: String
+    Default: capacity-foresight
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    Description: Prefix for named resources.
+  GlueDatabaseName:
+    Type: String
+    Default: capacity_foresight
+    AllowedPattern: '^[a-z][a-z0-9_]{1,63}$'
+  DiscoveryTagKey:
+    Type: String
+    Default: capacity-foresight
+    MinLength: 1
+    Description: Resources carrying this tag are monitored.
+  DiscoveryTagValue:
+    Type: String
+    Default: monitor
+    MinLength: 1
+  ContextTagKeys:
+    Type: String
+    Default: Name
+    Description: >-
+      Comma-separated tag keys whose values are shown to the model as context (for example Name,Application,Owner).
+      Other tags are never sent to the model.
+  MaxResources:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 1000
+    Description: Safety cap per run. Larger fleets need a Distributed Map (see README).
+  ScheduleExpression:
+    Type: String
+    Default: rate(6 hours)
+    AllowedPattern: '^(rate|cron)\(.+\)$'
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  SuppressionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 90
+    Description: >-
+      An unchanged finding is emailed at most once in this period. Worse urgency re-notifies immediately. If the metric
+      returns to healthy (and the alert is at least 24 hours old), the record is cleared and a recurrence alerts again.
+  GuardrailId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^[a-zA-Z0-9]{0,64}$'
+    Description: Optional. Your own Amazon Bedrock Guardrail ID (used only when CreateGuardrail is false).
+  GuardrailVersion:
+    Type: String
+    Default: ""
+    AllowedPattern: '^(DRAFT|[0-9]{1,8})?$'
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 365
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+Conditions:
+  CreateGuardrailC: !Equals [!Ref CreateGuardrail, "true"]
+  HasOwnGuardrail: !And [!Equals [!Ref CreateGuardrail, "false"], !Not [!Equals [!Ref GuardrailId, ""]]]
+  HasGuardrail: !Or [!Condition CreateGuardrailC, !Condition HasOwnGuardrail]
+  HasHighRisk: !Not [!Equals [!Ref BedrockHighRiskModelId, ""]]
+  HasFallback: !Not [!Equals [!Ref BedrockFallbackModelId, ""]]
+  UseRdsEvents: !Equals [!Ref EnableRdsEvents, "true"]
+  UseComputeOptimizer: !Equals [!Ref EnableComputeOptimizer, "true"]
+  UseCloudTrail: !Equals [!Ref EnableCloudTrailChanges, "true"]
+  DigestOn: !Equals [!Ref EnableDigest, "true"]
+  AlarmsOn: !Equals [!Ref EnableAlarms, "true"]
+
+Mappings:
+  HoursToSeconds:
+    "6": { Seconds: 21600 }
+    "12": { Seconds: 43200 }
+    "18": { Seconds: 64800 }
+    "24": { Seconds: 86400 }
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 120
+    Environment:
+      Variables:
+        DATA_BUCKET: !Ref DataBucket
+        SUPPRESSION_TABLE: !Ref SuppressionTable
+        TOPIC_ARN: !Ref NotificationTopic
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        BEDROCK_HIGH_RISK_MODEL_ID: !Ref BedrockHighRiskModelId
+        BEDROCK_FALLBACK_MODEL_ID: !Ref BedrockFallbackModelId
+        ACCOUNT_ID: !Ref AWS::AccountId
+        DISCOVERY_TAG_KEY: !Ref DiscoveryTagKey
+        DISCOVERY_TAG_VALUE: !Ref DiscoveryTagValue
+        CONTEXT_TAG_KEYS: !Ref ContextTagKeys
+        MAX_RESOURCES: !Ref MaxResources
+        SUPPRESSION_DAYS: !Ref SuppressionDays
+        GUARDRAIL_ID: !If [CreateGuardrailC, !GetAtt Guardrail.GuardrailId, !Ref GuardrailId]
+        GUARDRAIL_VERSION: !If [CreateGuardrailC, !GetAtt GuardrailPublishedVersion.Version, !Ref GuardrailVersion]
+        ROUTING_TAG_KEY: !Ref RoutingTagKey
+        ENRICHMENT_SOURCES: !Join
+          - ","
+          - - !If [UseRdsEvents, rds_events, ""]
+            - !If [UseComputeOptimizer, compute_optimizer, ""]
+            - !If [UseCloudTrail, cloudtrail_changes, ""]
+        RECOMMENDATION_CACHE_HOURS: !Ref RecommendationCacheHours
+        MIN_IMMEDIATE_URGENCY: !Ref MinImmediateUrgency
+        DIGEST_PER_ROUTE: !Ref DigestPerRoute
+
+Resources:
+  # ------------------------------------------------------------------ storage
+  # Server access logs go to a separate bucket. The log bucket needs its policy in place before this bucket
+  # is created, because S3 checks the delivery permission when logging is switched on.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: AccessLogBucketPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Object Lock would block the retention rules below and make clean-up impossible. Not a fit for data
+          # that is regenerated and expires after DataRetentionDays.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          # Public access is blocked, ACLs are disabled (BucketOwnerEnforced) and nothing sets an ACL.
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LoggingConfiguration: { DestinationBucketName: !Ref AccessLogBucket, LogFilePrefix: data-bucket/ }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-series, Status: Enabled, Prefix: series/, ExpirationInDays: !Ref DataRetentionDays }
+          - { Id: expire-findings, Status: Enabled, Prefix: findings/, ExpirationInDays: !Ref DataRetentionDays }
+          - { Id: expire-athena-results, Status: Enabled, Prefix: athena-results/, ExpirationInDays: 7 }
+          # Versioning keeps the previous copy of an overwritten or expired object. Drop old versions and the
+          # delete markers that expiry leaves behind, so storage does not grow without bound.
+          - Id: clean-old-versions
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED         # This is the destination for access logs. Logging it would be circular.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED    # Logs expire by lifecycle rule, so Object Lock would block clean-up.
+          - S3_BUCKET_NO_PUBLIC_RW_ACL        # Public access is blocked and ACLs are disabled.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Destination bucket for server access logs. AWS advises against enabling logging on it: logs about logs form an endless loop."
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-access-logs, Status: Enabled, ExpirationInDays: !Ref DataRetentionDays }
+          - Id: clean-old-versions
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ServerAccessLogs
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "${AccessLogBucket.Arn}/data-bucket/*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AccessLogBucket.Arn, !Sub "${AccessLogBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": false } }
+          - Sid: DenyOldTlsVersions
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AccessLogBucket.Arn, !Sub "${AccessLogBucket.Arn}/*"]
+            Condition: { NumericLessThan: { "s3:TlsVersion": 1.2 } }
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": false } }
+          - Sid: DenyOldTlsVersions
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition: { NumericLessThan: { "s3:TlsVersion": 1.2 } }
+
+  # Customer managed key for the de-duplication table and the function log groups. Rotation is on.
+  # Only the account administration statement and CloudWatch Logs (pinned to this stack's log groups) are
+  # allowed in the key policy. The functions get their own scoped grants in their roles.
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ResourcePrefix} suppression table and log group encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: ["kms:Encrypt", "kms:Decrypt", "kms:ReEncryptFrom", "kms:ReEncryptTo", "kms:GenerateDataKey", "kms:DescribeKey"]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn":
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/states/${ResourcePrefix}"
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ResourcePrefix}-data"
+      TargetKeyId: !Ref DataKey
+  SuppressionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+      SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt DataKey.Arn }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  # ---------------------------------------------------------------- alerting
+  # A customer managed key is required so that CloudWatch alarms can publish to the encrypted topic.
+  # (CloudWatch cannot use the AWS managed key alias/aws/sns.)
+  NotificationKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ResourcePrefix} alert topic encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*" }
+
+  NotificationKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ResourcePrefix}-alerts"
+      TargetKeyId: !Ref NotificationKey
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref NotificationKey
+
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref NotificationTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: { AWS: "*" }
+            Action: ["sns:Publish", "sns:Subscribe"]
+            Resource: !Ref NotificationTopic
+            Condition: { Bool: { "aws:SecureTransport": false } }
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*" }
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------- guardrail
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Condition: CreateGuardrailC
+    Properties:
+      Name: !Sub "${ResourcePrefix}-guardrail"
+      Description: Prompt-attack filter for account-controlled text sent to the capacity advisor.
+      BlockedInputMessaging: The request was blocked by the guardrail.
+      BlockedOutputsMessaging: The response was blocked by the guardrail.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+
+  GuardrailPublishedVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Condition: CreateGuardrailC
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: Version used by the workflow
+
+  # --------------------------------------------------------------- functions
+  DiscoverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties: { LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-discover", RetentionInDays: !Ref LogRetentionDays, KmsKeyId: !GetAtt DataKey.Arn }
+  AnalyzeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties: { LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-analyze", RetentionInDays: !Ref LogRetentionDays, KmsKeyId: !GetAtt DataKey.Arn }
+  RecommendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties: { LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-recommend", RetentionInDays: !Ref LogRetentionDays, KmsKeyId: !GetAtt DataKey.Arn }
+  NotifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties: { LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-notify", RetentionInDays: !Ref LogRetentionDays, KmsKeyId: !GetAtt DataKey.Arn }
+
+  DiscoverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-discover"
+      # CodeUri must be set on each function: `aws cloudformation package` ignores it in Globals
+      # and would zip the whole project folder instead of src/.
+      CodeUri: src/
+      Handler: handlers.discover.handler
+      LoggingConfig: { LogGroup: !Ref DiscoverLogGroup }
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # The managed AWSLambdaBasicExecutionRole allows log writes anywhere. This keeps the function to its own log group.
+            - Sid: LogsOnlyToOwnLogGroup
+              Effect: Deny
+              Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+              NotResource: !GetAtt DiscoverLogGroup.Arn
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: tag:GetResources
+              Resource: "*"
+
+  AnalyzeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-analyze"
+      # CodeUri must be set on each function: `aws cloudformation package` ignores it in Globals
+      # and would zip the whole project folder instead of src/.
+      CodeUri: src/
+      Handler: handlers.analyze.handler
+      MemorySize: 512
+      LoggingConfig: { LogGroup: !Ref AnalyzeLogGroup }
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # The managed AWSLambdaBasicExecutionRole allows log writes anywhere. This keeps the function to its own log group.
+            - Sid: LogsOnlyToOwnLogGroup
+              Effect: Deny
+              Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+              NotResource: !GetAtt AnalyzeLogGroup.Arn
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: cloudwatch:GetMetricData
+              Resource: "*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${DataBucket.Arn}/series/*"
+            # Clears the earlier alert when a metric is healthy again, so a recurrence is announced.
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt SuppressionTable.Arn
+            - Sid: UseDataKey
+              Effect: Allow
+              Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+              Resource: !GetAtt DataKey.Arn
+              Condition: { StringEquals: { "kms:ViaService": !Sub "dynamodb.${AWS::Region}.amazonaws.com" } }
+
+  RecommendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-recommend"
+      # CodeUri must be set on each function: `aws cloudformation package` ignores it in Globals
+      # and would zip the whole project folder instead of src/.
+      CodeUri: src/
+      Handler: handlers.recommend.handler
+      Timeout: 300
+      LoggingConfig: { LogGroup: !Ref RecommendLogGroup }
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # The managed AWSLambdaBasicExecutionRole allows log writes anywhere. This keeps the function to its own log group.
+            - Sid: LogsOnlyToOwnLogGroup
+              Effect: Deny
+              Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+              NotResource: !GetAtt RecommendLogGroup.Arn
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: DescribeResources
+              Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+                - autoscaling:DescribeAutoScalingGroups
+              Resource: "*"   # these actions have no resource type in the Service Authorization Reference
+            - Sid: DescribeRdsInstances
+              Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:ListTagsForResource
+              Resource: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:*"
+            - Sid: RecommendationCache
+              Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt SuppressionTable.Arn
+              Condition:
+                ForAllValues:StringLike: { "dynamodb:LeadingKeys": ["rec#*"] }
+            - Sid: UseDataKey
+              Effect: Allow
+              Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+              Resource: !GetAtt DataKey.Arn
+              Condition: { StringEquals: { "kms:ViaService": !Sub "dynamodb.${AWS::Region}.amazonaws.com" } }
+            - Sid: InvokeModels
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockFoundationModelId}"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                - !If
+                  - HasHighRisk
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockHighRiskFoundationModelId}"
+                  - !Ref AWS::NoValue
+                - !If
+                  - HasHighRisk
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockHighRiskModelId}"
+                  - !Ref AWS::NoValue
+                - !If
+                  - HasFallback
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockFallbackFoundationModelId}"
+                  - !Ref AWS::NoValue
+                - !If
+                  - HasFallback
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockFallbackModelId}"
+                  - !Ref AWS::NoValue
+            - !If
+              - HasGuardrail
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !If
+                  - CreateGuardrailC
+                  - !GetAtt Guardrail.GuardrailArn
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/${GuardrailId}"
+              - !Ref AWS::NoValue
+            - !If
+              - UseRdsEvents
+              - Sid: EnrichRdsEvents
+                Effect: Allow
+                Action: rds:DescribeEvents
+                Resource: "*"
+              - !Ref AWS::NoValue
+            - !If
+              - UseComputeOptimizer
+              - Sid: EnrichComputeOptimizer
+                Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetRDSDatabaseRecommendations
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                Resource: "*"
+              - !Ref AWS::NoValue
+            - !If
+              - UseComputeOptimizer
+              - Sid: DescribeRdsClusters
+                Effect: Allow
+                # Compute Optimizer calls this with the caller's permissions (see the AWS managed
+                # ComputeOptimizerReadOnlyAccess policy). The other actions it uses are granted above.
+                Action: rds:DescribeDBClusters
+                Resource: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:*"
+              - !Ref AWS::NoValue
+            - !If
+              - UseCloudTrail
+              - Sid: EnrichCloudTrailChanges
+                Effect: Allow
+                Action: cloudtrail:LookupEvents
+                Resource: "*"
+              - !Ref AWS::NoValue
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-notify"
+      # CodeUri must be set on each function: `aws cloudformation package` ignores it in Globals
+      # and would zip the whole project folder instead of src/.
+      CodeUri: src/
+      Handler: handlers.notify.handler
+      Timeout: 60
+      LoggingConfig: { LogGroup: !Ref NotifyLogGroup }
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # The managed AWSLambdaBasicExecutionRole allows log writes anywhere. This keeps the function to its own log group.
+            - Sid: LogsOnlyToOwnLogGroup
+              Effect: Deny
+              Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+              NotResource: !GetAtt NotifyLogGroup.Arn
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: DeduplicationRecords
+              Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:DeleteItem]
+              Resource: !GetAtt SuppressionTable.Arn
+              Condition:
+                ForAllValues:StringNotLike: { "dynamodb:LeadingKeys": ["rec#*"] }
+            - Sid: UseDataKey
+              Effect: Allow
+              Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+              Resource: !GetAtt DataKey.Arn
+              Condition: { StringEquals: { "kms:ViaService": !Sub "dynamodb.${AWS::Region}.amazonaws.com" } }
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref NotificationTopic
+            - Sid: UseTopicKey
+              Effect: Allow
+              Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+              Resource: !GetAtt NotificationKey.Arn
+              Condition: { StringEquals: { "kms:ViaService": !Sub "sns.${AWS::Region}.amazonaws.com" } }
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${DataBucket.Arn}/findings/*"
+
+  DigestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DigestOn
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties: { LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-digest", RetentionInDays: !Ref LogRetentionDays, KmsKeyId: !GetAtt DataKey.Arn }
+
+  DigestFunction:
+    Type: AWS::Serverless::Function
+    Condition: DigestOn
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-digest"
+      # CodeUri must be set on each function: `aws cloudformation package` ignores it in Globals
+      # and would zip the whole project folder instead of src/.
+      CodeUri: src/
+      Handler: handlers.digest.handler
+      Timeout: 120
+      LoggingConfig: { LogGroup: !Ref DigestLogGroup }
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref DigestSchedule
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # The managed AWSLambdaBasicExecutionRole allows log writes anywhere. This keeps the function to its own log group.
+            - Sid: LogsOnlyToOwnLogGroup
+              Effect: Deny
+              Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+              NotResource: !GetAtt DigestLogGroup.Arn
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DataBucket.Arn
+              Condition: { StringLike: { "s3:prefix": "findings/*" } }
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${DataBucket.Arn}/findings/*"
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref NotificationTopic
+            - Sid: UseTopicKey
+              Effect: Allow
+              Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+              Resource: !GetAtt NotificationKey.Arn
+              Condition: { StringEquals: { "kms:ViaService": !Sub "sns.${AWS::Region}.amazonaws.com" } }
+
+  # --------------------------------------------------------------- workflow
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK   # RetentionInDays is set from a parameter limited to the allowed values.
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ResourcePrefix}"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt DataKey.Arn
+
+  CapacityStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${ResourcePrefix}-workflow"
+      Type: STANDARD
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref DiscoverFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref AnalyzeFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref RecommendFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref NotifyFunction }
+        # SAM adds the log-delivery permissions only when it creates the log group itself. This stack
+        # supplies its own log group (for retention), so they must be granted here. AWS requires "*" for
+        # these delivery actions; see "Enable logging from AWS services" in the CloudWatch Logs guide.
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: StateMachineLogDelivery
+              Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref ScheduleExpression
+            State: !Ref ScheduleState
+            Input: "{}"
+      DefinitionSubstitutions:
+        DiscoverArn: !GetAtt DiscoverFunction.Arn
+        AnalyzeArn: !GetAtt AnalyzeFunction.Arn
+        RecommendArn: !GetAtt RecommendFunction.Arn
+        NotifyArn: !GetAtt NotifyFunction.Arn
+      Definition:
+        Comment: Discover -> per resource (Analyze -> per finding (Recommend -> Notify))
+        # Bound a stuck run so it cannot overlap many later schedules. The failure alarm reports it.
+        TimeoutSeconds: 10800
+        StartAt: Discover
+        States:
+          Discover:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            TimeoutSeconds: 150
+            Parameters:
+              FunctionName: ${DiscoverArn}
+              Payload.$: $
+            ResultSelector:
+              run_id.$: $.Payload.run_id
+              demo.$: $.Payload.demo
+              resources.$: $.Payload.resources
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+            Next: AnyResources
+          AnyResources:
+            Type: Choice
+            Choices:
+              - Variable: $.resources[0]
+                IsPresent: true
+                Next: ProcessResources
+            Default: NothingToDo
+          NothingToDo:
+            Type: Succeed
+          ProcessResources:
+            Type: Map
+            ItemsPath: $.resources
+            MaxConcurrency: 10
+            ResultPath: null
+            ItemSelector:
+              resource.$: $$.Map.Item.Value
+              run_id.$: $.run_id
+              demo.$: $.demo
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: Analyze
+              States:
+                Analyze:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  TimeoutSeconds: 150
+                  Parameters:
+                    FunctionName: ${AnalyzeArn}
+                    Payload.$: $
+                  ResultSelector:
+                    findings.$: $.Payload.findings
+                    metric_errors.$: $.Payload.metric_errors
+                  ResultPath: $.analysis
+                  Retry:
+                    - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                      IntervalSeconds: 2
+                      MaxAttempts: 4
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: [States.ALL]
+                      ResultPath: $.error
+                      Next: ResourceFailed
+                  Next: HasFindings
+                HasFindings:
+                  Type: Choice
+                  Choices:
+                    - Variable: $.analysis.findings[0]
+                      IsPresent: true
+                      Next: ProcessFindings
+                  Default: ResourceDone
+                ProcessFindings:
+                  Type: Map
+                  ItemsPath: $.analysis.findings
+                  MaxConcurrency: 2
+                  ResultPath: null
+                  ItemSelector:
+                    finding.$: $$.Map.Item.Value
+                    demo.$: $.demo
+                  ItemProcessor:
+                    ProcessorConfig: { Mode: INLINE }
+                    StartAt: Recommend
+                    States:
+                      Recommend:
+                        Type: Task
+                        Resource: arn:aws:states:::lambda:invoke
+                        TimeoutSeconds: 330
+                        Parameters:
+                          FunctionName: ${RecommendArn}
+                          Payload.$: $
+                        ResultSelector:
+                          finding.$: $.Payload.finding
+                          recommendation.$: $.Payload.recommendation
+                          recommendation_source.$: $.Payload.recommendation_source
+                          model_id.$: $.Payload.model_id
+                          route.$: $.Payload.route
+                        Retry:
+                          - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                            IntervalSeconds: 2
+                            MaxAttempts: 4
+                            BackoffRate: 2
+                        Catch:
+                          - ErrorEquals: [States.ALL]
+                            ResultPath: $.error
+                            Next: FindingFailed
+                        Next: Notify
+                      Notify:
+                        Type: Task
+                        Resource: arn:aws:states:::lambda:invoke
+                        TimeoutSeconds: 90
+                        Parameters:
+                          FunctionName: ${NotifyArn}
+                          Payload.$: $
+                        ResultSelector:
+                          notified.$: $.Payload.notified
+                        Retry:
+                          - ErrorEquals: [States.ALL]
+                            IntervalSeconds: 5
+                            MaxAttempts: 3
+                            BackoffRate: 2
+                        Catch:
+                          - ErrorEquals: [States.ALL]
+                            ResultPath: $.error
+                            Next: FindingFailed
+                        End: true
+                      FindingFailed:
+                        Type: Pass
+                        End: true
+                  Next: ResourceDone
+                ResourceFailed:
+                  Type: Pass
+                  End: true
+                ResourceDone:
+                  Type: Pass
+                  End: true
+            End: true
+
+  # -------------------------------------------------------------------- alarms
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmDescription: A workflow execution failed (not just one resource inside it).
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref CapacityStateMachine }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmDescription: >-
+        A Lambda function in the workflow returned an error. Per-resource failures are caught inside the workflow,
+        so this is the signal that something is failing quietly.
+      Metrics:
+        - Id: discover
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref DiscoverFunction }] }
+            Period: 3600
+            Stat: Sum
+        - Id: analyze
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref AnalyzeFunction }] }
+            Period: 3600
+            Stat: Sum
+        - Id: recommend
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref RecommendFunction }] }
+            Period: 3600
+            Stat: Sum
+        - Id: notify
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref NotifyFunction }] }
+            Period: 3600
+            Stat: Sum
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: Errors across the workflow
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  AiFallbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmDescription: >-
+        No model produced a usable recommendation, so alerts were sent with the plain notice. Check model access,
+        quotas, the guardrail and whether the configured model has been retired.
+      Namespace: CapacityForesight
+      MetricName: RecommendationFallback
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  MissingRunAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmDescription: >-
+        The workflow has not started recently, so nothing is being monitored. Expect this alarm right after
+        deployment until the first run completes.
+      Namespace: AWS/States
+      MetricName: ExecutionsStarted
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref CapacityStateMachine }]
+      Statistic: Sum
+      Period: !FindInMap [HoursToSeconds, !Ref MissingRunAlarmHours, Seconds]
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  # ----------------------------------------------------------------- analytics
+  AnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Capacity Foresight series, forecasts and findings
+
+  SeriesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AnalyticsDatabase
+      TableInput:
+        Name: capacity_series
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: dt, Type: string }]
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.range: !Sub "NOW-${DataRetentionDays}DAYS,NOW"
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${DataBucket}/series/dt=${!dt}/'
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/series/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat
+          SerdeInfo: { SerializationLibrary: org.openx.data.jsonserde.JsonSerDe }
+          Columns:
+            - { Name: run_id, Type: string }
+            - { Name: account_id, Type: string }
+            - { Name: region, Type: string }
+            - { Name: resource_type, Type: string }
+            - { Name: resource_id, Type: string }
+            - { Name: metric_name, Type: string }
+            - { Name: threshold, Type: double }
+            - { Name: ts, Type: string }
+            - { Name: kind, Type: string }
+            - { Name: value, Type: double }
+
+  FindingsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AnalyticsDatabase
+      TableInput:
+        Name: capacity_findings
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: dt, Type: string }]
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.range: !Sub "NOW-${DataRetentionDays}DAYS,NOW"
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${DataBucket}/findings/dt=${!dt}/'
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/findings/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat
+          SerdeInfo: { SerializationLibrary: org.openx.data.jsonserde.JsonSerDe }
+          Columns:
+            - { Name: run_id, Type: string }
+            - { Name: finding_ts, Type: string }
+            - { Name: account_id, Type: string }
+            - { Name: region, Type: string }
+            - { Name: resource_type, Type: string }
+            - { Name: resource_id, Type: string }
+            - { Name: metric_name, Type: string }
+            - { Name: threshold, Type: double }
+            - { Name: direction, Type: string }
+            - { Name: horizon_hours, Type: int }
+            - { Name: status, Type: string }
+            - { Name: current_value, Type: double }
+            - { Name: projected_value_at_horizon, Type: double }
+            - { Name: runway_hours, Type: double }
+            - { Name: runway_earliest_hours, Type: double }
+            - { Name: runway_latest_hours, Type: double }
+            - { Name: slope_per_day, Type: double }
+            - { Name: r2, Type: double }
+            - { Name: n_points, Type: int }
+            - { Name: accelerating, Type: boolean }
+            - { Name: level_shift, Type: boolean }
+            - { Name: urgency, Type: string }
+            - { Name: confidence, Type: string }
+            - { Name: summary, Type: string }
+            - { Name: probable_cause, Type: string }
+            - { Name: top_action, Type: string }
+            - { Name: actions, Type: string }
+            - { Name: recommendation_source, Type: string }
+            - { Name: model_id, Type: string }
+            - { Name: route, Type: string }
+            - { Name: delivery, Type: string }
+            - { Name: notified, Type: boolean }
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ResourcePrefix}"
+      State: ENABLED
+      # create_views.sh and the dashboards leave queries in the workgroup. Without this, deleting the stack
+      # fails with "WorkGroup is not empty".
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref CapacityStateMachine
+  DataBucketName:
+    Value: !Ref DataBucket
+  AccessLogBucketName:
+    Value: !Ref AccessLogBucket
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+  GlueDatabase:
+    Value: !Ref AnalyticsDatabase
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

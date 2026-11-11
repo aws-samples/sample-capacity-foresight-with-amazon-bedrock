@@ -1,0 +1,58 @@
+{
+  "version": "1.0.0",
+  "defaults": {
+    "lookback_days": 28,
+    "min_points": 7,
+    "min_r2": 0.3,
+    "weekly_seasonality": true,
+    "detect_level_shift": true,
+    "interval_z": 1.28,
+    "urgency_bands_hours": {
+      "CRITICAL": 24,
+      "HIGH": 48,
+      "MEDIUM": 96
+    }
+  },
+  "metrics": [
+    {
+      "resource_type": "EC2",
+      "metric_name": "CPUUtilization",
+      "threshold": 85,
+      "unit": "Percent",
+      "direction": "ABOVE",
+      "horizon_hours": 72
+    },
+    {
+      "resource_type": "RDS",
+      "metric_name": "CPUUtilization",
+      "threshold": 85,
+      "unit": "Percent",
+      "direction": "ABOVE",
+      "horizon_hours": 72
+    },
+    {
+      "resource_type": "RDS",
+      "metric_name": "FreeStorageSpace",
+      "threshold": 10737418240,
+      "unit": "Bytes",
+      "direction": "BELOW",
+      "horizon_hours": 168
+    },
+    {
+      "resource_type": "RDS",
+      "metric_name": "FreeableMemory",
+      "threshold": 536870912,
+      "unit": "Bytes",
+      "direction": "BELOW",
+      "horizon_hours": 48
+    },
+    {
+      "resource_type": "EBS",
+      "metric_name": "BurstBalance",
+      "threshold": 20,
+      "unit": "Percent",
+      "direction": "BELOW",
+      "horizon_hours": 24
+    }
+  ]
+}
