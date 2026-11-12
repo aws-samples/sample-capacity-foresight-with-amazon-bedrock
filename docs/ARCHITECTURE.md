@@ -30,6 +30,7 @@ flowchart LR
     SNS[Amazon SNS email, filter policies per team]
     DIG[Daily digest]
     S3[(Amazon S3 JSON Lines)]
+    DDB[(Amazon DynamoDB: de-duplication records plus recommendation cache)]
     ALM[Alarms on the pipeline itself]
   end
 
@@ -53,6 +54,9 @@ flowchart LR
   R --> N --> SNS
   N --> S3
   A --> S3
+  N -->|de-duplicate| DDB
+  R <-->|cache| DDB
+  A -->|clear on recovery| DDB
   S3 --> DIG --> SNS
   S3 --> GLUE --> ATH
   ATH --> QS
