@@ -26,7 +26,7 @@ flowchart LR
     N[Notify: de-duplicate, route, email]
   end
 
-  subgraph OUT[Outputs]
+  subgraph OUT[Outputs and state]
     SNS[Amazon SNS email, filter policies per team]
     DIG[Daily digest]
     S3[(Amazon S3 JSON Lines)]
