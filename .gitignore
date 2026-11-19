@@ -8,3 +8,6 @@ packaged.yaml
 evals/results/
 .ash/
 .holmes/
+docs/cloudops-3518_blog.md
+docs/PREREQUISITES.md
+.bbr/*

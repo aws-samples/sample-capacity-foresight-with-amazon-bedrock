@@ -1,4 +1,5 @@
 boto3==1.43.127
+botocore[crt]
 pytest==9.2.0
 cfn-lint==1.60.0
 aws-sam-translator==1.116.0

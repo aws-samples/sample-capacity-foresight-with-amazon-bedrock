@@ -25,7 +25,13 @@ import sys
 import time
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError, CredentialRetrievalError
+
+# Handle optional CRT dependency for SSO login
+try:
+    from botocore.exceptions import MissingDependencyException
+except ImportError:
+    MissingDependencyException = None
 
 ROLE_NAME = "capacity-foresight-quicksight-athena"
 ROLE_PATH = "/"
@@ -141,15 +147,67 @@ def main(argv: list[str] | None = None) -> int:
 
     session = boto3.Session(region_name=args.region)
     region = session.region_name
-    account = session.client("sts").get_caller_identity()["Account"]
+
+    # Validate AWS credentials before proceeding
+    try:
+        account = session.client("sts").get_caller_identity()["Account"]
+    except NoCredentialsError:
+        print("Error: No AWS credentials found.", file=sys.stderr)
+        print("Configure credentials using one of:", file=sys.stderr)
+        print("  - aws configure", file=sys.stderr)
+        print("  - aws sso login", file=sys.stderr)
+        print("  - Export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY", file=sys.stderr)
+        return 1
+    except CredentialRetrievalError as e:
+        print(f"Error: Failed to retrieve AWS credentials: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # Handle MissingDependencyException for SSO login without CRT
+        if MissingDependencyException and isinstance(e, MissingDependencyException):
+            print("Error: Missing dependency for AWS SSO login.", file=sys.stderr)
+            print("Install the CRT dependency with:", file=sys.stderr)
+            print('  pip install "botocore[crt]"', file=sys.stderr)
+            print("Or use a different credential method (access keys, instance profile).", file=sys.stderr)
+            return 1
+        if "MissingDependencyException" in type(e).__name__:
+            print("Error: Missing dependency for AWS SSO login.", file=sys.stderr)
+            print("Install the CRT dependency with:", file=sys.stderr)
+            print('  pip install "botocore[crt]"', file=sys.stderr)
+            print("Or use a different credential method (access keys, instance profile).", file=sys.stderr)
+            return 1
+        raise
+
     cfn, iam, glue, qs = (session.client(n) for n in ("cloudformation", "iam", "glue", "quicksight"))
 
-    outputs = {o["OutputKey"]: o["OutputValue"] for o in cfn.describe_stacks(StackName=args.stack_name)["Stacks"][0]["Outputs"]}
+    # Verify the stack exists
+    try:
+        stack_response = cfn.describe_stacks(StackName=args.stack_name)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ValidationError" and "does not exist" in str(exc):
+            print(f"Error: CloudFormation stack '{args.stack_name}' does not exist.", file=sys.stderr)
+            print("Deploy the stack first using:", file=sys.stderr)
+            print("  ./scripts/deploy.sh", file=sys.stderr)
+            print("Or specify a different stack name with --stack-name", file=sys.stderr)
+            return 1
+        raise
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack_response["Stacks"][0]["Outputs"]}
     bucket, database, workgroup = outputs["DataBucketName"], outputs["GlueDatabase"], outputs["AthenaWorkGroupName"]
 
     try:
         qs.describe_account_subscription(AwsAccountId=account)
-    except ClientError:
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        error_msg = exc.response["Error"]["Message"]
+        if error_code == "AccessDeniedException" and "identity region" in error_msg:
+            # Extract the correct region from the error message
+            import re
+            match = re.search(r"use the (\S+) endpoint", error_msg)
+            correct_region = match.group(1) if match else "us-east-1"
+            print(f"Error: QuickSight identity region mismatch.", file=sys.stderr)
+            print(f"Your QuickSight identity is in {correct_region}, but you're using {region}.", file=sys.stderr)
+            print(f"Run again with: --region {correct_region}", file=sys.stderr)
+            return 1
         raise SystemExit("This account has no QuickSight subscription. Subscribe first (see docs/PREREQUISITES.md).")
 
     principal = args.principal

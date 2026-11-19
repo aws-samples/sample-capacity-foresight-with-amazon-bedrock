@@ -19,7 +19,13 @@ import sys
 import time
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError, CredentialRetrievalError
+
+# Handle optional CRT dependency for SSO login
+try:
+    from botocore.exceptions import MissingDependencyException
+except ImportError:
+    MissingDependencyException = None
 
 ANALYSIS_ID = "capacity-foresight-analysis"
 DASHBOARD_ID = "capacity-foresight-dashboard"
@@ -217,7 +223,14 @@ def definition(default_series: str = "") -> dict:
 def most_urgent_series(session, stack_name: str) -> str:
     """The 'resource / metric' label of the most urgent current finding, used as the dashboard's default."""
     cfn, athena = session.client("cloudformation"), session.client("athena")
-    out = {o["OutputKey"]: o["OutputValue"] for o in cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]}
+    try:
+        out = {o["OutputKey"]: o["OutputValue"] for o in cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]}
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ValidationError" and "does not exist" in str(exc):
+            raise SystemExit(f"Error: CloudFormation stack '{stack_name}' does not exist.\n"
+                           f"Deploy the stack first using: ./scripts/deploy.sh\n"
+                           f"Or specify a different stack name with --stack-name")
+        raise
     database = out["GlueDatabase"]
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", database):  # an identifier cannot be a bound parameter in Athena
         raise SystemExit(f"unexpected Glue database name {database!r}")
@@ -267,8 +280,56 @@ def main(argv: list[str] | None = None) -> int:
 
     session = boto3.Session(region_name=args.region)
     region = session.region_name
-    account = session.client("sts").get_caller_identity()["Account"]
+
+    # Validate AWS credentials before proceeding
+    try:
+        account = session.client("sts").get_caller_identity()["Account"]
+    except NoCredentialsError:
+        print("Error: No AWS credentials found.", file=sys.stderr)
+        print("Configure credentials using one of:", file=sys.stderr)
+        print("  - aws configure", file=sys.stderr)
+        print("  - aws sso login", file=sys.stderr)
+        print("  - Export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY", file=sys.stderr)
+        return 1
+    except CredentialRetrievalError as e:
+        print(f"Error: Failed to retrieve AWS credentials: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # Handle MissingDependencyException for SSO login without CRT
+        if MissingDependencyException and isinstance(e, MissingDependencyException):
+            print("Error: Missing dependency for AWS SSO login.", file=sys.stderr)
+            print("Install the CRT dependency with:", file=sys.stderr)
+            print('  pip install "botocore[crt]"', file=sys.stderr)
+            print("Or use a different credential method (access keys, instance profile).", file=sys.stderr)
+            return 1
+        if "MissingDependencyException" in type(e).__name__:
+            print("Error: Missing dependency for AWS SSO login.", file=sys.stderr)
+            print("Install the CRT dependency with:", file=sys.stderr)
+            print('  pip install "botocore[crt]"', file=sys.stderr)
+            print("Or use a different credential method (access keys, instance profile).", file=sys.stderr)
+            return 1
+        raise
+
     qs = session.client("quicksight")
+
+    # Verify QuickSight access and check for region mismatch
+    try:
+        qs.describe_account_subscription(AwsAccountId=account)
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        error_msg = exc.response["Error"]["Message"]
+        if error_code == "AccessDeniedException" and "identity region" in error_msg:
+            # Extract the correct region from the error message
+            match = re.search(r"use the (\S+) endpoint", error_msg)
+            correct_region = match.group(1) if match else "us-east-1"
+            print(f"Error: QuickSight identity region mismatch.", file=sys.stderr)
+            print(f"Your QuickSight identity is in {correct_region}, but you're using {region}.", file=sys.stderr)
+            print(f"Run again with: --region {correct_region}", file=sys.stderr)
+            return 1
+        print("Error: This account has no QuickSight subscription.", file=sys.stderr)
+        print("Subscribe first (see docs/PREREQUISITES.md).", file=sys.stderr)
+        return 1
+
     principal = args.principal
     if not principal:
         users = qs.list_users(AwsAccountId=account, Namespace="default")["UserList"]
