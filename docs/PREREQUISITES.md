@@ -46,7 +46,7 @@ aws s3 ls s3://$ARTIFACTS_BUCKET
 - Set `BedrockModelId` to the model ID or inference profile ID you tested, and `BedrockFoundationModelId` to the base model behind it (the same value if you call the model directly). IAM is scoped to exactly these.
 - **Plan for model retirement.** Models are retired on a published schedule. Set `BedrockFallbackModelId` (and its `BedrockFallbackFoundationModelId`) to a second model so alerts keep their AI plans if the first stops working, and review the [model lifecycle page](https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle.html) when you deploy. The `RecommendationFallback` alarm tells you when no model worked.
 - Optional: set `BedrockHighRiskModelId` (and its foundation model ID) to use a larger model only for CRITICAL and HIGH findings.
-- **Guardrail.** By default the stack creates an [Amazon Bedrock Guardrail](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) with the prompt-attack filter and applies it to every call. Confirm your model supports guardrails with the Converse API in your Region. Set `CreateGuardrail=false` to bring your own (`GuardrailId`, `GuardrailVersion`) or to run without one. If the guardrail blocks a request the model call counts as failed, the next model is tried, and finally the plain notice is sent.
+- **Guardrail.** By default the stack creates an [Amazon Bedrock Guardrail](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) with the prompt-attack filter and applies it to every call. Confirm your model supports guardrails with the Converse API in your Region. Set `CreateGuardrail=false` to bring your own (`GuardrailId`, `GuardrailVersion`) or to run without one. If the guardrail blocks a request, no other model is tried, because the same guardrail would block it. The plain notice is sent and the `GuardrailIntervention` metric is recorded instead of `RecommendationFallback`, so the fallback alarm does not fire.
 - Data handling: the model receives the metric trend, the resource's configuration (instance class, storage size, engine, pending modifications and so on), the values of the tag keys you list in `ContextTagKeys`, and the optional signals in section 2a. Review this against your data policies. Resource IDs and tag values are sent; raw metric history, identities and credentials are not.
 
 ```bash
@@ -279,7 +279,7 @@ aws sns subscribe \
   --topic-arn "$SNS_TOPIC_ARN" \
   --protocol email \
   --notification-endpoint platform-team@example.com \
-  --attributes '{"FilterPolicy":"{\"Team\":[\"platform\"]}"}' \
+  --attributes '{"FilterPolicy":"{\"route\":[\"platform\"]}"}' \
   --region us-east-1
 ```
 
