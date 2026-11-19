@@ -73,7 +73,7 @@ def demo_hourly(rule: MetricRule, resource_id: str, lookback_days: int, now: dat
         ts = now - timedelta(hours=hours - i)
         days_ago = (hours - i) / 24.0
         if resource_id == "demo-rds-orders" and rule.metric_name == "FreeStorageSpace":
-            # Free space shrinking 3.4 GiB per day: about a day from the 10 GiB threshold.
+            # Free space shrinking 3.4 GiB per day from about 16 GiB: roughly 40 hours from the 10 GiB threshold.
             value = (16.0 + 3.4 * days_ago) * GIB + 0.3 * GIB * math.sin(i / 3.0)
         elif resource_id == "demo-rds-reporting" and rule.metric_name == "FreeStorageSpace":
             value = 80 * GIB + 0.2 * GIB * math.sin(i / 5.0)  # healthy, flat

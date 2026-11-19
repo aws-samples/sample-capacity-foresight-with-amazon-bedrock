@@ -33,20 +33,10 @@ AWS Step Functions
   Analyze + Notify write JSON lines --> Amazon S3 --> AWS Glue tables --> Athena views --> QuickSight
 ```
 
-## Where AI is used, and where it is not
-
-| Concern | Approach | Why |
-|---|---|---|
-| Trend, runway range, confidence | Deterministic least squares in code | Numbers must be reproducible and explainable. |
-| Minimum urgency | Derived from the earliest runway (24/48/96 hour bands, configurable) | The model may raise urgency but can never lower it. |
-| Probable cause, ranked actions, sizing, risk, cost direction, verification steps | **Amazon Bedrock** | Depends on engine, storage type, Auto Scaling limits, Multi-AZ, recent changes. A fixed action catalog cannot cover that. |
-| Model output | Tool-use JSON validated against an allow-list of action types, bounded lengths, links removed | Free text from a model is never executed or trusted blindly. |
-| Untrusted input | Tags are allow-listed and sanitized, `<` `>` escaped, passed as delimited data and (by default) through a Guardrail prompt-attack filter | Mitigates prompt injection through tags and AWS-supplied text. |
-| Model unavailable or retired | Optional fallback model, then a plain notice email | An outage in the AI layer must not silence alerts. |
-
 ## Deploy
 
-Read [`docs/PREREQUISITES.md`](docs/PREREQUISITES.md) first (Bedrock model access, CloudWatch metrics, tags, QuickSight).
+**Prerequisites:** See [`docs/PREREQUISITES.md`](docs/PREREQUISITES.md) for detailed setup (Bedrock model access, CloudWatch metrics, resource tagging, QuickSight).
+
 
 ```bash
 export AWS_REGION=us-east-1
@@ -180,6 +170,18 @@ Know before you deploy:
 ## Cost
 
 The workflow runs a few Lambda invocations per tagged resource per run, one Bedrock call per finding that is not served from the cache, and small S3 (including versioning and access logs), Athena, DynamoDB (including point-in-time recovery) and KMS usage. The Bedrock call dominates and scales with the number of findings, not the number of resources. A high-risk model costs more per call, so use it only for CRITICAL and HIGH if you set one. Check current pricing for [Bedrock](https://aws.amazon.com/bedrock/pricing/), [Lambda](https://aws.amazon.com/lambda/pricing/) and [Step Functions](https://aws.amazon.com/step-functions/pricing/). QuickSight is billed per user and is optional.
+
+
+## Where AI is used, and where it is not
+
+| Concern | Approach | Why |
+|---|---|---|
+| Trend, runway range, confidence | Deterministic least squares in code | Numbers must be reproducible and explainable. |
+| Minimum urgency | Derived from the earliest runway (24/48/96 hour bands, configurable) | The model may raise urgency but can never lower it. |
+| Probable cause, ranked actions, sizing, risk, cost direction, verification steps | **Amazon Bedrock** | Depends on engine, storage type, Auto Scaling limits, Multi-AZ, recent changes. A fixed action catalog cannot cover that. |
+| Model output | Tool-use JSON validated against an allow-list of action types, bounded lengths, links removed | Free text from a model is never executed or trusted blindly. |
+| Untrusted input | Tags are allow-listed and sanitized, `<` `>` escaped, passed as delimited data and (by default) through a Guardrail prompt-attack filter | Mitigates prompt injection through tags and AWS-supplied text. |
+| Model unavailable or retired | Optional fallback model, then a plain notice email | An outage in the AI layer must not silence alerts. |
 
 ## Limitations
 
