@@ -227,6 +227,8 @@ tests/                   unit tests (no AWS calls)
 docs/                    PREREQUISITES, ARCHITECTURE, GRAFANA
 ```
 
+See [`src/README.md`](src/README.md) for detailed documentation of the core library, Lambda handlers, and configuration. See [`scripts/README.md`](scripts/README.md) for usage details on each script.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the security policy, known considerations and how to report a vulnerability.
