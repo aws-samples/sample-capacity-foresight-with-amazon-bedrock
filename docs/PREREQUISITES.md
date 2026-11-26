@@ -17,11 +17,11 @@ aws sts get-caller-identity
 # Check your current region
 aws configure get region
 
-# Verify Python 3 is installed (use python3 on macOS/Linux)
-python3 --version
+# Verify Python is installed (use python3 on macOS/Linux)
+python --version
 
 # Create and activate a virtual environment
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install Python dependencies
@@ -30,13 +30,15 @@ pip install -r requirements-dev.txt
 # If using AWS SSO login, you may also need the CRT dependency:
 pip install "botocore[crt]"
 
-# Create an S3 bucket for artifacts (if you don't have one)
 export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=$AWS_REGION  # Some SDKs use this instead of AWS_REGION
 export ARTIFACTS_BUCKET=my-capacity-foresight-artifacts-$(aws sts get-caller-identity --query Account --output text)
+
+# Create an S3 bucket for artifacts (if you don't have one)
 aws s3 mb s3://$ARTIFACTS_BUCKET --region $AWS_REGION
 
 # Or verify an existing bucket
-aws s3 ls s3://$ARTIFACTS_BUCKET
+aws s3 ls s3://$ARTIFACTS_BUCKET --region $AWS_REGION
 ```
 
 ## 2. Amazon Bedrock model access
@@ -209,8 +211,8 @@ The email path works without one. Pick the tool you already use:
 
 1. Subscribe in the account. The Enterprise edition is what new accounts get. For the smallest set-up, use `IAM_ONLY` authentication and a single user at the Author level (the person who subscribes is registered at a higher, more expensive level by default; change it with `update-user --role AUTHOR`). QuickSight is billed per user per month plus usage, so check the [pricing page](https://aws.amazon.com/quicksight/pricing/).
 2. **Deploy the stack first** using `./scripts/deploy.sh` — the QuickSight scripts require the stack outputs (bucket, database, workgroup).
-3. Run `python3 scripts/setup_quicksight.py --stack-name <stack>`. It creates a role that can read only this stack's bucket, Athena workgroup and Glue database, and passes it to the Athena data source, so you do **not** need to grant QuickSight access to S3 in the console.
-4. Run `python3 scripts/create_dashboard.py --stack-name <stack>`.
+3. Run `python scripts/setup_quicksight.py --stack-name <stack>`. It creates a role that can read only this stack's bucket, Athena workgroup and Glue database, and passes it to the Athena data source, so you do **not** need to grant QuickSight access to S3 in the console.
+4. Run `python scripts/create_dashboard.py --stack-name <stack>`.
 5. Share dashboards with groups, not individuals, and limit who can edit datasets. Findings contain account IDs, resource IDs and advice text.
 
 **Important:** QuickSight identity region may differ from your stack region. If you get a region mismatch error, add `--region <identity-region>` to the QuickSight scripts. The error message will tell you the correct region.
@@ -239,8 +241,8 @@ export STACK_NAME=capacity-foresight
 
 # If your QuickSight identity region differs from your stack region, add --region
 # The scripts will tell you the correct region if there's a mismatch
-python3 scripts/setup_quicksight.py --stack-name $STACK_NAME --region us-east-1
-python3 scripts/create_dashboard.py --stack-name $STACK_NAME --region us-east-1
+python scripts/setup_quicksight.py --stack-name $STACK_NAME --region us-east-1
+python scripts/create_dashboard.py --stack-name $STACK_NAME --region us-east-1
 
 # List QuickSight users to verify setup
 aws quicksight list-users \
